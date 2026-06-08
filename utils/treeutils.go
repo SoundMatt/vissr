@@ -54,6 +54,32 @@ type HimTree struct {
 
 var himForest []HimTree
 
+// ForestInfo is a JSON-serialisable summary of one tree in the HIM forest.
+type ForestInfo struct {
+	RootName string `json:"rootName"`
+	Domain   string `json:"domain"`
+	Version  string `json:"version"`
+}
+
+// ForestInfoList returns metadata for every tree currently in the HIM forest.
+func ForestInfoList() []ForestInfo {
+	out := make([]ForestInfo, 0, len(himForest))
+	for _, t := range himForest {
+		out = append(out, ForestInfo{RootName: t.RootName, Domain: t.Domain, Version: t.Version})
+	}
+	return out
+}
+
+// GetForestRoot returns the root Node_t for the named tree, or nil.
+func GetForestRoot(rootName string) *Node_t {
+	for i := range himForest {
+		if himForest[i].RootName == rootName {
+			return himForest[i].Handle
+		}
+	}
+	return nil
+}
+
 type LeafPathList struct {
 	LeafPaths []string
 }
@@ -313,6 +339,20 @@ func NewIoStructNode(name string, children ...*Node_t) *Node_t {
 // NewPropertyNode creates a property Node_t for a service parameter.
 func NewPropertyNode(name, datatype, description string) *Node_t {
 	return &Node_t{Name: name, NodeType: PROPERTY, Datatype: datatype, Description: description}
+}
+
+// NewSignalNode creates a signal Node_t (sensor, actuator, or attribute).
+// nodeType must be one of the SENSOR, ACTUATOR, ATTRIBUTE constants.
+func NewSignalNode(name, nodeType, datatype, description, min, max, unit string) *Node_t {
+	return &Node_t{
+		Name:        name,
+		NodeType:    nodeType,
+		Datatype:    datatype,
+		Description: description,
+		Min:         min,
+		Max:         max,
+		Unit:        unit,
+	}
 }
 
 func CreatePathListFile(pListPath string) {
