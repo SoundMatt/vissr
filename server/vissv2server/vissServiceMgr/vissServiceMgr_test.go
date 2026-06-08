@@ -1,55 +1,44 @@
 package vissServiceMgr
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
 
-// Tests for the VISSv3.2 service manager.
-// Node-handle functions (SetRootNodePointer, VSSgetType, etc.) require a
-// live binary tree and are integration-only; they are exercised via the
-// vissv2server integration tests. Unit tests here cover pure logic that
-// does not touch the tree.
+// Unit tests for the VISSv3.3-alpha service manager.
+// Functions that require a live binary tree (SetRootNodePointer, VSSgetType,
+// validateInputSignature) are integration-only and are documented as such
+// rather than unit-tested here.
 
-func init() {
-	// Seed the global sessions/states maps to a known-empty state.
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
+func resetState() {
+	invocations = map[string]*invocationState{}
+	sessions = map[string]*monitorSession{}
+	metricsMu.Lock()
+	metrics = map[string]*pathMetrics{}
+	metricsMu.Unlock()
 }
 
-// ---- helpers ---------------------------------------------------------------
+// ---- generateId ------------------------------------------------------------
 
-func makeChan() chan map[string]interface{} {
-	return make(chan map[string]interface{}, 8)
-}
-
-// ---- generateServiceId -----------------------------------------------------
-
-func TestGenerateServiceId_Length(t *testing.T) {
-	id := generateServiceId()
-	if len(id) == 0 {
-		t.Fatal("generateServiceId returned empty string")
+func TestGenerateId_NonEmpty(t *testing.T) {
+	if id := generateId(); len(id) == 0 {
+		t.Fatal("generateId returned empty string")
 	}
 }
 
-func TestGenerateServiceId_Unique(t *testing.T) {
+func TestGenerateId_Unique(t *testing.T) {
 	ids := map[string]struct{}{}
 	for i := 0; i < 1000; i++ {
-		ids[generateServiceId()] = struct{}{}
+		ids[generateId()] = struct{}{}
 	}
-	if len(ids) < 900 { // tolerate a small collision rate
-		t.Fatalf("generateServiceId produced too many collisions: %d unique from 1000", len(ids))
+	if len(ids) < 900 {
+		t.Fatalf("too many collisions: %d unique from 1000", len(ids))
 	}
 }
 
 // ---- getTimestamp ----------------------------------------------------------
-
-func TestGetTimestamp_NonEmpty(t *testing.T) {
-	ts := getTimestamp()
-	if len(ts) == 0 {
-		t.Fatal("getTimestamp returned empty string")
-	}
-}
 
 func TestGetTimestamp_RFC3339(t *testing.T) {
 	ts := getTimestamp()
@@ -58,30 +47,36 @@ func TestGetTimestamp_RFC3339(t *testing.T) {
 	}
 }
 
-// ---- getState --------------------------------------------------------------
+// ---- latestInvocationForPath -----------------------------------------------
 
-func TestGetState_CreatesUnknown(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
-
-	s := getState("Test.Proc")
-	if s == nil {
-		t.Fatal("getState returned nil")
-	}
-	if s.status != StatusUnknown {
-		t.Fatalf("want UNKNOWN, got %q", s.status)
+func TestLatestInvocationForPath_NoneReturnsNil(t *testing.T) {
+	resetState()
+	if latestInvocationForPath("No.Such.Path") != nil {
+		t.Error("expected nil for unknown path")
 	}
 }
 
-func TestGetState_Idempotent(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
+func TestLatestInvocationForPath_ReturnsNewest(t *testing.T) {
+	resetState()
+	early := &invocationState{serviceId: "s1", path: "A.B", status: StatusOngoing,
+		startedAt: time.Now().Add(-time.Second)}
+	late := &invocationState{serviceId: "s2", path: "A.B", status: StatusOngoing,
+		startedAt: time.Now()}
+	invocations["s1"] = early
+	invocations["s2"] = late
 
-	s1 := getState("Test.Proc2")
-	s1.status = StatusOngoing
-	s2 := getState("Test.Proc2")
-	if s2.status != StatusOngoing {
-		t.Fatalf("second getState should return same object; got %q", s2.status)
+	got := latestInvocationForPath("A.B")
+	if got == nil || got.serviceId != "s2" {
+		t.Errorf("expected s2 (newest), got %v", got)
+	}
+}
+
+func TestLatestInvocationForPath_IgnoresTerminal(t *testing.T) {
+	resetState()
+	invocations["s1"] = &invocationState{serviceId: "s1", path: "A.B",
+		status: StatusSuccessful, startedAt: time.Now()}
+	if latestInvocationForPath("A.B") != nil {
+		t.Error("should ignore non-ONGOING invocations")
 	}
 }
 
@@ -100,61 +95,64 @@ func TestExtractFilterVariant_MapVariant(t *testing.T) {
 	}
 }
 
-func TestExtractFilterVariant_StringJSON(t *testing.T) {
-	f := `{"variant":"status"}`
-	if v := extractFilterVariant(f); v != "status" {
+func TestExtractFilterVariant_JSONString(t *testing.T) {
+	if v := extractFilterVariant(`{"variant":"status"}`); v != "status" {
 		t.Fatalf("want status, got %q", v)
 	}
 }
 
-func TestExtractFilterVariant_None(t *testing.T) {
-	f := map[string]interface{}{"variant": "none"}
-	if v := extractFilterVariant(f); v != "none" {
-		t.Fatalf("want none, got %q", v)
+func TestExtractFilterVariant_MissingVariant(t *testing.T) {
+	if v := extractFilterVariant(map[string]interface{}{"parameter": "x"}); v != "all" {
+		t.Fatalf("want all, got %q", v)
 	}
 }
 
-func TestExtractFilterVariant_MissingVariantKey(t *testing.T) {
-	f := map[string]interface{}{"parameter": "x"}
-	if v := extractFilterVariant(f); v != "all" {
-		t.Fatalf("want all (fallback), got %q", v)
+// ---- periodFromFilter ------------------------------------------------------
+
+func TestPeriodFromFilter_Valid(t *testing.T) {
+	f := map[string]interface{}{
+		"variant":   "timebased",
+		"parameter": map[string]interface{}{"period": "250"},
+	}
+	p := periodFromFilter(f)
+	if p != 250*time.Millisecond {
+		t.Fatalf("want 250ms, got %v", p)
 	}
 }
 
-// ---- extractRouterIndex ----------------------------------------------------
-
-func TestExtractRouterIndex_Present(t *testing.T) {
-	m := map[string]interface{}{"routerIndex": 3}
-	if i := extractRouterIndex(m); i != 3 {
-		t.Fatalf("want 3, got %d", i)
+func TestPeriodFromFilter_NilDefaultsToSecond(t *testing.T) {
+	if p := periodFromFilter(nil); p != time.Second {
+		t.Fatalf("want 1s, got %v", p)
 	}
 }
 
-func TestExtractRouterIndex_Missing(t *testing.T) {
+func TestPeriodFromFilter_InvalidFallsBack(t *testing.T) {
+	f := map[string]interface{}{"variant": "timebased", "parameter": map[string]interface{}{"period": "abc"}}
+	if p := periodFromFilter(f); p != time.Second {
+		t.Fatalf("want 1s default, got %v", p)
+	}
+}
+
+// ---- timeoutFromRequest ----------------------------------------------------
+
+func TestTimeoutFromRequest_MsInt(t *testing.T) {
+	m := map[string]interface{}{"timeout": float64(5000)}
+	if d := timeoutFromRequest(m); d != 5*time.Second {
+		t.Fatalf("want 5s, got %v", d)
+	}
+}
+
+func TestTimeoutFromRequest_StringMs(t *testing.T) {
+	m := map[string]interface{}{"timeout": "2000"}
+	if d := timeoutFromRequest(m); d != 2*time.Second {
+		t.Fatalf("want 2s, got %v", d)
+	}
+}
+
+func TestTimeoutFromRequest_MissingUsesDefault(t *testing.T) {
 	m := map[string]interface{}{}
-	if i := extractRouterIndex(m); i != 0 {
-		t.Fatalf("want 0 (default), got %d", i)
-	}
-}
-
-// ---- copyRouteFields -------------------------------------------------------
-
-func TestCopyRouteFields_CopiesKnownKeys(t *testing.T) {
-	src := map[string]interface{}{
-		"RouterId":    "1?abc",
-		"routerIndex": 2,
-		"otherKey":   "shouldNotCopy",
-	}
-	dst := map[string]interface{}{}
-	copyRouteFields(src, dst)
-	if dst["RouterId"] != "1?abc" {
-		t.Error("RouterId not copied")
-	}
-	if dst["routerIndex"] != 2 {
-		t.Error("routerIndex not copied")
-	}
-	if _, ok := dst["otherKey"]; ok {
-		t.Error("otherKey should not have been copied")
+	if d := timeoutFromRequest(m); d != DefaultTimeout {
+		t.Fatalf("want DefaultTimeout, got %v", d)
 	}
 }
 
@@ -166,50 +164,471 @@ func TestCopyMap_Nil(t *testing.T) {
 	}
 }
 
-func TestCopyMap_ShallowCopy(t *testing.T) {
-	src := map[string]interface{}{"a": "1", "b": "2"}
+func TestCopyMap_Independent(t *testing.T) {
+	src := map[string]interface{}{"a": "1"}
 	dst := copyMap(src)
-	if dst["a"] != "1" || dst["b"] != "2" {
-		t.Error("values not copied correctly")
-	}
-	// Mutation of dst must not affect src.
 	dst["a"] = "changed"
 	if src["a"] != "1" {
-		t.Error("copyMap is not a shallow copy — src was mutated")
+		t.Error("src was mutated by copyMap")
 	}
 }
 
-// ---- isServiceAction (server-level predicate, tested here for parity) ------
+// ---- copyRouteFields -------------------------------------------------------
+
+func TestCopyRouteFields(t *testing.T) {
+	src := map[string]interface{}{"RouterId": "1?x", "routerIndex": 3, "other": "skip"}
+	dst := map[string]interface{}{}
+	copyRouteFields(src, dst)
+	if dst["RouterId"] != "1?x" {
+		t.Error("RouterId not copied")
+	}
+	if dst["routerIndex"] != 3 {
+		t.Error("routerIndex not copied")
+	}
+	if _, ok := dst["other"]; ok {
+		t.Error("unexpected key copied")
+	}
+}
+
+// ---- sendServiceError ------------------------------------------------------
+
+func TestSendServiceError_RequiredFields(t *testing.T) {
+	ch := make(chan map[string]interface{}, 4)
+	sendServiceError(ch, "invoke", "req-1", "", StatusFailed, "400", "bad_request", "oops")
+	select {
+	case m := <-ch:
+		if m["action"] != "invoke" {
+			t.Errorf("wrong action: %v", m["action"])
+		}
+		if m["status"] != "FAILED" {
+			t.Errorf("wrong status: %v", m["status"])
+		}
+		errObj, ok := m["error"].(map[string]interface{})
+		if !ok || errObj["number"] != "400" {
+			t.Errorf("wrong error: %v", m["error"])
+		}
+		if m["requestId"] != "req-1" {
+			t.Errorf("wrong requestId: %v", m["requestId"])
+		}
+		if m["ts"] == nil {
+			t.Error("ts missing")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// ---- HandleCancel ----------------------------------------------------------
+
+func TestHandleCancel_MissingServiceId(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	HandleCancel(map[string]interface{}{}, ch)
+	select {
+	case m := <-ch:
+		if _, ok := m["error"]; !ok {
+			t.Error("expected error response")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestHandleCancel_UnknownServiceId(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	HandleCancel(map[string]interface{}{"serviceId": "no-such"}, ch)
+	select {
+	case m := <-ch:
+		if _, ok := m["error"]; !ok {
+			t.Error("expected error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+func TestHandleCancel_InvokeSessionCancelsService(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+
+	// Pre-seed an invoke session + matching invocation.
+	invocations["inv-1"] = &invocationState{serviceId: "inv-1", path: "S.P", status: StatusOngoing}
+	sessions["sid-1"] = &monitorSession{sessionId: "sid-1", serviceId: "inv-1", isInvoke: true}
+
+	HandleCancel(map[string]interface{}{"serviceId": "sid-1"}, ch)
+
+	select {
+	case m := <-ch:
+		if m["status"] != "CANCELED" {
+			t.Errorf("want CANCELED, got %v", m["status"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if _, ok := sessions["sid-1"]; ok {
+		t.Error("session should be removed")
+	}
+	if _, ok := invocations["inv-1"]; ok {
+		t.Error("invocation should be removed")
+	}
+}
+
+func TestHandleCancel_MonitorSessionLeavesServiceAlive(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+
+	invocations["inv-2"] = &invocationState{serviceId: "inv-2", path: "S.P2", status: StatusOngoing}
+	sessions["sid-2"] = &monitorSession{sessionId: "sid-2", serviceId: "inv-2", isInvoke: false}
+
+	HandleCancel(map[string]interface{}{"serviceId": "sid-2"}, ch)
+	<-ch
+
+	if _, ok := invocations["inv-2"]; !ok {
+		t.Error("invocation should remain when monitor session is cancelled")
+	}
+	if invocations["inv-2"].status != StatusOngoing {
+		t.Errorf("service status should stay ONGOING, got %v", invocations["inv-2"].status)
+	}
+}
+
+// ---- UpdateServiceState ----------------------------------------------------
+
+func TestUpdateServiceState_FanOut(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 8)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["inv-3"] = &invocationState{serviceId: "inv-3", path: "S.P3", status: StatusOngoing}
+	sessions["sid-3"] = &monitorSession{sessionId: "sid-3", serviceId: "inv-3",
+		routerIndex: 0, filterKind: "all"}
+
+	UpdateServiceState("inv-3", StatusSuccessful, map[string]interface{}{"x": "1"}, nil, nil, bcs)
+
+	select {
+	case event := <-ch:
+		if event["action"] != "monitoring" {
+			t.Errorf("wrong action: %v", event["action"])
+		}
+		if event["status"] != "SUCCESSFUL" {
+			t.Errorf("wrong status: %v", event["status"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
+	}
+
+	if _, ok := sessions["sid-3"]; ok {
+		t.Error("session should be removed after terminal status")
+	}
+}
+
+func TestUpdateServiceState_StatusFilterOnlyOnChange(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 8)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["inv-4"] = &invocationState{serviceId: "inv-4", path: "S.P4", status: StatusOngoing}
+	sessions["sid-4"] = &monitorSession{sessionId: "sid-4", serviceId: "inv-4",
+		routerIndex: 0, filterKind: "status"}
+
+	// Status unchanged → should NOT deliver.
+	UpdateServiceState("inv-4", StatusOngoing, nil, nil, nil, bcs)
+	select {
+	case <-ch:
+		t.Error("status filter should not deliver when status unchanged")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Status changed → SHOULD deliver.
+	UpdateServiceState("inv-4", StatusSuccessful, nil, nil, nil, bcs)
+	select {
+	case <-ch:
+	case <-time.After(time.Second):
+		t.Fatal("expected event on status change")
+	}
+}
+
+func TestUpdateServiceState_NoneFilterNeverDelivers(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 8)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["inv-5"] = &invocationState{serviceId: "inv-5", path: "S.P5", status: StatusOngoing}
+	sessions["sid-5"] = &monitorSession{sessionId: "sid-5", serviceId: "inv-5",
+		routerIndex: 0, filterKind: "none"}
+
+	UpdateServiceState("inv-5", StatusSuccessful, nil, nil, nil, bcs)
+	select {
+	case <-ch:
+		t.Error("'none' filter should never deliver events")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestUpdateServiceState_UnknownInvocationIsNoop(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	UpdateServiceState("does-not-exist", StatusFailed, nil, nil, nil, bcs)
+	select {
+	case <-ch:
+		t.Error("unknown invocation should not produce events")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestUpdateServiceState_ServiceErrorIncludedInEvent verifies that a non-nil
+// ServiceError is included in monitoring events as {"error":{"code":...,"message":...}}.
+func TestUpdateServiceState_ServiceErrorIncludedInEvent(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["inv-e"] = &invocationState{serviceId: "inv-e", path: "S.PE", status: StatusOngoing}
+	sessions["sid-e"] = &monitorSession{sessionId: "sid-e", serviceId: "inv-e",
+		routerIndex: 0, filterKind: "all"}
+
+	svcErr := &ServiceError{Code: "MOTOR_STALL", Message: "seat motor stalled"}
+	UpdateServiceState("inv-e", StatusFailed, nil, svcErr, nil, bcs)
+
+	select {
+	case event := <-ch:
+		errField, ok := event["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("event missing 'error' field: %v", event)
+		}
+		if errField["code"] != "MOTOR_STALL" {
+			t.Errorf("wrong error code: %v", errField["code"])
+		}
+		if errField["message"] != "seat motor stalled" {
+			t.Errorf("wrong error message: %v", errField["message"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for error event")
+	}
+}
+
+// ---- FormatAsSSE -----------------------------------------------------------
+
+func TestFormatAsSSE_ValidJSON(t *testing.T) {
+	event := map[string]interface{}{
+		"action": "monitoring",
+		"status": "ONGOING",
+		"ts":     "2026-01-01T00:00:00Z",
+	}
+	got, err := FormatAsSSE(event)
+	if err != nil {
+		t.Fatalf("FormatAsSSE error: %v", err)
+	}
+	if !strings.HasPrefix(got, "data: ") {
+		t.Errorf("SSE frame must start with 'data: ', got %q", got[:min(20, len(got))])
+	}
+	if !strings.HasSuffix(got, "\n\n") {
+		t.Errorf("SSE frame must end with double newline, got %q", got[max(0, len(got)-4):])
+	}
+	// The JSON payload inside must be valid.
+	payload := strings.TrimPrefix(strings.TrimSuffix(got, "\n\n"), "data: ")
+	var decoded map[string]interface{}
+	if err := json.Unmarshal([]byte(payload), &decoded); err != nil {
+		t.Errorf("SSE payload is not valid JSON: %v", err)
+	}
+	if decoded["action"] != "monitoring" {
+		t.Errorf("wrong action in SSE payload: %v", decoded["action"])
+	}
+}
+
+func TestFormatAsSSE_EmptyEvent(t *testing.T) {
+	got, err := FormatAsSSE(map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got != "data: {}\n\n" {
+		t.Errorf("unexpected output for empty event: %q", got)
+	}
+}
+
+// ---- StartServiceRegServerTLS ----------------------------------------------
+
+func TestStartServiceRegServerTLS_InvalidCertReturnsError(t *testing.T) {
+	err := StartServiceRegServerTLS(nil, "/nonexistent/cert.pem", "/nonexistent/key.pem")
+	if err == nil {
+		t.Fatal("expected error for missing TLS certificate files")
+	}
+	if !strings.Contains(err.Error(), "load TLS") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+// ---- isServiceAction (tested locally to avoid circular import) -------------
 
 func TestIsServiceAction(t *testing.T) {
 	for _, a := range []string{"invoke", "monitor", "cancel", "discover"} {
 		if !isServiceActionStr(a) {
-			t.Errorf("expected %q to be a service action", a)
+			t.Errorf("%q should be a service action", a)
 		}
 	}
-	for _, a := range []string{"get", "set", "subscribe", "unsubscribe", ""} {
+	for _, a := range []string{"get", "set", "subscribe", ""} {
 		if isServiceActionStr(a) {
-			t.Errorf("expected %q NOT to be a service action", a)
+			t.Errorf("%q should NOT be a service action", a)
 		}
 	}
 }
 
-// isServiceActionStr mirrors the server-level predicate so we can test it
-// without importing the vissv2server package (avoid circular imports).
-func isServiceActionStr(action string) bool {
-	switch action {
+func isServiceActionStr(a string) bool {
+	switch a {
 	case "invoke", "monitor", "cancel", "discover":
 		return true
 	}
 	return false
 }
 
-// ---- sendServiceError ------------------------------------------------------
+// ---- startTimeoutWatchdog --------------------------------------------------
 
-func TestSendServiceError_HasRequiredFields(t *testing.T) {
-	ch := makeChan()
-	sendServiceError(ch, "invoke", "req-1", "", StatusFailed,
-		"400", "bad_request", "test error")
+// TestTimeoutWatchdog_FiresOnExpiry verifies that an ONGOING invocation is
+// transitioned to FAILED after its deadline passes.
+func TestTimeoutWatchdog_FiresOnExpiry(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	inv := &invocationState{
+		serviceId: "tw-1",
+		path:      "S.Tw",
+		status:    StatusOngoing,
+		deadline:  time.Now().Add(20 * time.Millisecond),
+	}
+	invocations["tw-1"] = inv
+	sessions["tw-s1"] = &monitorSession{sessionId: "tw-s1", serviceId: "tw-1",
+		routerIndex: 0, filterKind: "all"}
+
+	// Store cancelFn under mu: UpdateServiceState reads inv.cancelFn under mu.
+	cancelFn := startTimeoutWatchdog(inv, bcs)
+	mu.Lock()
+	inv.cancelFn = cancelFn
+	mu.Unlock()
+
+	select {
+	case event := <-ch:
+		if event["status"] != "FAILED" {
+			t.Errorf("want FAILED from timeout, got %v", event["status"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout watchdog did not fire")
+	}
+
+	// Invocation must be removed on terminal status.
+	mu.Lock()
+	_, still := invocations["tw-1"]
+	mu.Unlock()
+	if still {
+		t.Error("invocation should be removed after timeout")
+	}
+}
+
+// TestTimeoutWatchdog_CancelPreventsExpiry verifies that calling the cancel
+// function stops the watchdog before it fires.
+func TestTimeoutWatchdog_CancelPreventsExpiry(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	inv := &invocationState{
+		serviceId: "tw-2",
+		path:      "S.Tw2",
+		status:    StatusOngoing,
+		deadline:  time.Now().Add(50 * time.Millisecond),
+	}
+	invocations["tw-2"] = inv
+
+	cancel := startTimeoutWatchdog(inv, bcs)
+	cancel() // stop before deadline
+
+	select {
+	case <-ch:
+		t.Error("watchdog fired after cancel")
+	case <-time.After(100 * time.Millisecond):
+		// correct: no event after cancel
+	}
+}
+
+// ---- Concurrent invocation isolation ----------------------------------------
+
+// TestConcurrentInvocations_IndependentState verifies that two concurrent
+// invocations of the same procedure maintain independent state (VISSv3.3 §10).
+func TestConcurrentInvocations_IndependentState(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 8)
+	bcs := []chan map[string]interface{}{ch}
+
+	// Two concurrent invocations of the same path.
+	invocations["ci-1"] = &invocationState{serviceId: "ci-1", path: "S.PC", status: StatusOngoing,
+		startedAt: time.Now().Add(-time.Millisecond)}
+	invocations["ci-2"] = &invocationState{serviceId: "ci-2", path: "S.PC", status: StatusOngoing,
+		startedAt: time.Now()}
+	sessions["cs-1"] = &monitorSession{sessionId: "cs-1", serviceId: "ci-1", routerIndex: 0, filterKind: "all"}
+	sessions["cs-2"] = &monitorSession{sessionId: "cs-2", serviceId: "ci-2", routerIndex: 0, filterKind: "all"}
+
+	// Only terminate ci-1 successfully.
+	UpdateServiceState("ci-1", StatusSuccessful, map[string]interface{}{"r": "ok"}, nil, nil, bcs)
+
+	// ci-2 must still be ONGOING.
+	mu.Lock()
+	ci2, ok := invocations["ci-2"]
+	mu.Unlock()
+	if !ok || ci2.status != StatusOngoing {
+		t.Error("ci-2 should remain ONGOING after ci-1 terminates")
+	}
+
+	// Only one event should have been delivered (for cs-1).
+	select {
+	case event := <-ch:
+		if event["serviceId"] != "cs-1" {
+			t.Errorf("expected cs-1 event, got serviceId=%v", event["serviceId"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected one monitoring event")
+	}
+	select {
+	case extra := <-ch:
+		t.Errorf("unexpected second event: %v", extra)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+// ---- HandleInvoke/HandleMonitor bounds guard --------------------------------
+
+func TestHandleInvoke_BadRouterIndex_DoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("HandleInvoke panicked with bad routerIndex: %v", r)
+		}
+	}()
+	resetState()
+	// routerIndex 99 is way out of range for a 1-channel slice.
+	req := map[string]interface{}{"path": "S.P", "requestId": "r1", "routerIndex": 99}
+	bcs := []chan map[string]interface{}{make(chan map[string]interface{}, 4)}
+	HandleInvoke(req, bcs)
+}
+
+func TestHandleMonitor_BadRouterIndex_DoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("HandleMonitor panicked with bad routerIndex: %v", r)
+		}
+	}()
+	resetState()
+	req := map[string]interface{}{"path": "S.P", "requestId": "r2", "routerIndex": 99}
+	bcs := []chan map[string]interface{}{make(chan map[string]interface{}, 4)}
+	HandleMonitor(req, bcs)
+}
+
+// ---- sendValidationError (§29) ---------------------------------------------
+
+func TestSendValidationError_IncludesFields(t *testing.T) {
+	ch := make(chan map[string]interface{}, 4)
+	sendValidationError(ch, "invoke", "req-v", []string{"SeatId", "Position"})
 	select {
 	case m := <-ch:
 		if m["action"] != "invoke" {
@@ -220,210 +639,226 @@ func TestSendServiceError_HasRequiredFields(t *testing.T) {
 		}
 		errObj, ok := m["error"].(map[string]interface{})
 		if !ok {
-			t.Fatal("error field missing or wrong type")
+			t.Fatalf("missing error object: %v", m)
 		}
 		if errObj["number"] != "400" {
 			t.Errorf("wrong error number: %v", errObj["number"])
 		}
-		if m["requestId"] != "req-1" {
+		rawFields := errObj["fields"]
+		if rawFields == nil {
+			t.Fatal("missing 'fields' in error object")
+		}
+		switch f := rawFields.(type) {
+		case []string:
+			if len(f) != 2 {
+				t.Errorf("want 2 fields, got %d", len(f))
+			}
+		case []interface{}:
+			if len(f) != 2 {
+				t.Errorf("want 2 fields (interface{}), got %d", len(f))
+			}
+		default:
+			t.Errorf("unexpected fields type: %T", rawFields)
+		}
+		if m["requestId"] != "req-v" {
 			t.Errorf("wrong requestId: %v", m["requestId"])
 		}
-		if _, ok := m["ts"]; !ok {
-			t.Error("ts field missing")
-		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for error response")
+		t.Fatal("timeout")
 	}
 }
 
-func TestSendServiceError_NoRequestIdWhenEmpty(t *testing.T) {
-	ch := makeChan()
-	sendServiceError(ch, "cancel", "", "svc-42", StatusFailed,
-		"400", "bad_request", "not found")
-	select {
-	case m := <-ch:
-		if _, ok := m["requestId"]; ok {
-			t.Error("requestId should be absent when empty")
-		}
-		if m["serviceId"] != "svc-42" {
-			t.Errorf("wrong serviceId: %v", m["serviceId"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out")
-	}
-}
-
-// ---- HandleCancel (pure-state paths) ---------------------------------------
-
-func TestHandleCancel_MissingServiceId(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
-	ch := makeChan()
-
-	HandleCancel(map[string]interface{}{}, ch)
-
+func TestSendValidationError_NilFields(t *testing.T) {
+	ch := make(chan map[string]interface{}, 4)
+	sendValidationError(ch, "invoke", "req-nil", nil)
 	select {
 	case m := <-ch:
 		errObj, ok := m["error"].(map[string]interface{})
 		if !ok {
-			t.Fatal("expected error response")
+			t.Fatalf("missing error object: %v", m)
 		}
-		if errObj["reason"] != "bad_request" {
-			t.Errorf("wrong reason: %v", errObj["reason"])
+		if _, ok := errObj["fields"]; !ok {
+			t.Error("'fields' key should be present even when nil")
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out")
+		t.Fatal("timeout")
 	}
 }
 
-func TestHandleCancel_UnknownServiceId(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
-	ch := makeChan()
+// ---- UpdateServiceState progress (§28) --------------------------------------
 
-	HandleCancel(map[string]interface{}{"serviceId": "no-such-id"}, ch)
+func TestUpdateServiceState_ProgressInOngoingEvent(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
 
-	select {
-	case m := <-ch:
-		if _, ok := m["error"]; !ok {
-			t.Error("expected error response for unknown serviceId")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out")
-	}
-}
+	invocations["inv-p1"] = &invocationState{serviceId: "inv-p1", path: "S.PP", status: StatusOngoing}
+	sessions["sid-p1"] = &monitorSession{sessionId: "sid-p1", serviceId: "inv-p1", routerIndex: 0, filterKind: "all"}
 
-func TestHandleCancel_InvokeSession_CancelsService(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
-	ch := makeChan()
-
-	// Pre-seed an invoke session.
-	sessions["sid-1"] = &serviceSession{
-		serviceId: "sid-1",
-		path:      "Svc.Proc",
-		isInvoke:  true,
-		status:    StatusOngoing,
-	}
-	states["Svc.Proc"] = &serviceState{status: StatusOngoing}
-
-	HandleCancel(map[string]interface{}{"serviceId": "sid-1"}, ch)
-
-	select {
-	case m := <-ch:
-		if m["status"] != "CANCELED" {
-			t.Errorf("want CANCELED, got %v", m["status"])
-		}
-		if m["serviceId"] != "sid-1" {
-			t.Errorf("wrong serviceId: %v", m["serviceId"])
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out")
-	}
-
-	// Session must be removed.
-	if _, ok := sessions["sid-1"]; ok {
-		t.Error("session should have been removed after cancel")
-	}
-	// Service state must be CANCELED.
-	if states["Svc.Proc"].status != StatusCanceled {
-		t.Errorf("service state should be CANCELED, got %v", states["Svc.Proc"].status)
-	}
-}
-
-func TestHandleCancel_MonitorSession_ServiceUnaffected(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
-	ch := makeChan()
-
-	sessions["sid-2"] = &serviceSession{
-		serviceId: "sid-2",
-		path:      "Svc.Proc2",
-		isInvoke:  false, // monitor session
-		status:    StatusOngoing,
-	}
-	states["Svc.Proc2"] = &serviceState{status: StatusOngoing}
-
-	HandleCancel(map[string]interface{}{"serviceId": "sid-2"}, ch)
-
-	select {
-	case <-ch:
-	case <-time.After(time.Second):
-		t.Fatal("timed out")
-	}
-
-	// Monitor cancel must NOT change service state.
-	if states["Svc.Proc2"].status != StatusOngoing {
-		t.Errorf("monitor cancel should not change service state; got %v", states["Svc.Proc2"].status)
-	}
-}
-
-// ---- UpdateServiceState ----------------------------------------------------
-
-func TestUpdateServiceState_FansOutToSessions(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
-
-	ch := makeChan()
-	backendChans := []chan map[string]interface{}{ch}
-
-	sessions["s1"] = &serviceSession{
-		serviceId:   "s1",
-		path:        "Svc.Fan",
-		routerIndex: 0,
-		status:      StatusOngoing,
-	}
-	states["Svc.Fan"] = &serviceState{status: StatusOngoing}
-
-	outdata := map[string]interface{}{"Position": "42"}
-	UpdateServiceState("Svc.Fan", StatusSuccessful, outdata, backendChans)
+	pct := 60
+	UpdateServiceState("inv-p1", StatusOngoing, nil, nil, &pct, bcs)
 
 	select {
 	case event := <-ch:
-		if event["action"] != "monitoring" {
-			t.Errorf("want 'monitoring' action, got %v", event["action"])
+		got, ok := event["progress"]
+		if !ok {
+			t.Fatal("progress field missing from ONGOING event")
 		}
-		if event["status"] != "SUCCESSFUL" {
-			t.Errorf("want SUCCESSFUL, got %v", event["status"])
-		}
-		if event["serviceId"] != "s1" {
-			t.Errorf("wrong serviceId: %v", event["serviceId"])
+		if got != 60 {
+			t.Errorf("want progress=60, got %v", got)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for fan-out event")
-	}
-
-	// Session removed on terminal status.
-	if _, ok := sessions["s1"]; ok {
-		t.Error("session should be removed after terminal status")
-	}
-	// State updated.
-	if states["Svc.Fan"].status != StatusSuccessful {
-		t.Errorf("state not updated; got %v", states["Svc.Fan"].status)
+		t.Fatal("timeout")
 	}
 }
 
-func TestUpdateServiceState_OngoingKeepsSessions(t *testing.T) {
-	sessions = map[string]*serviceSession{}
-	states = map[string]*serviceState{}
+func TestUpdateServiceState_NilProgressNotIncluded(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
 
-	ch := makeChan()
-	backendChans := []chan map[string]interface{}{ch}
+	invocations["inv-p2"] = &invocationState{serviceId: "inv-p2", path: "S.PP2", status: StatusOngoing}
+	sessions["sid-p2"] = &monitorSession{sessionId: "sid-p2", serviceId: "inv-p2", routerIndex: 0, filterKind: "all"}
 
-	sessions["s2"] = &serviceSession{
-		serviceId:   "s2",
-		path:        "Svc.Keep",
-		routerIndex: 0,
-		status:      StatusOngoing,
+	UpdateServiceState("inv-p2", StatusOngoing, nil, nil, nil, bcs)
+
+	select {
+	case event := <-ch:
+		if _, ok := event["progress"]; ok {
+			t.Error("progress should be absent when nil was passed")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
 	}
-	states["Svc.Keep"] = &serviceState{status: StatusOngoing}
+}
 
-	UpdateServiceState("Svc.Keep", StatusOngoing, nil, backendChans)
+func TestUpdateServiceState_ProgressAbsentOnTerminal(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
 
-	<-ch // consume the event
+	invocations["inv-p3"] = &invocationState{serviceId: "inv-p3", path: "S.PP3", status: StatusOngoing, startedAt: time.Now()}
+	sessions["sid-p3"] = &monitorSession{sessionId: "sid-p3", serviceId: "inv-p3", routerIndex: 0, filterKind: "all"}
 
-	// Session must remain for further updates.
-	if _, ok := sessions["s2"]; !ok {
-		t.Error("session should remain while status is ONGOING")
+	pct := 99
+	UpdateServiceState("inv-p3", StatusSuccessful, nil, nil, &pct, bcs)
+
+	select {
+	case event := <-ch:
+		if _, ok := event["progress"]; ok {
+			t.Error("progress should not be present in terminal (SUCCESSFUL) event")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout")
 	}
+}
+
+// ---- Observability metrics (§31) --------------------------------------------
+
+func TestMetrics_IncrementOnSuccessful(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["met-1"] = &invocationState{serviceId: "met-1", path: "M.Path1", status: StatusOngoing, startedAt: time.Now()}
+	sessions["ms-1"] = &monitorSession{sessionId: "ms-1", serviceId: "met-1", routerIndex: 0, filterKind: "all"}
+
+	UpdateServiceState("met-1", StatusSuccessful, nil, nil, nil, bcs)
+	<-ch
+
+	metricsMu.Lock()
+	pm := metrics["M.Path1"]
+	metricsMu.Unlock()
+	if pm == nil {
+		t.Fatal("metrics should be created for M.Path1")
+	}
+	if pm.total != 1 {
+		t.Errorf("want total=1, got %d", pm.total)
+	}
+	if pm.successes != 1 {
+		t.Errorf("want successes=1, got %d", pm.successes)
+	}
+	if pm.failures != 0 || pm.cancels != 0 {
+		t.Errorf("unexpected failures=%d cancels=%d", pm.failures, pm.cancels)
+	}
+}
+
+func TestMetrics_IncrementOnFailed(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["met-2"] = &invocationState{serviceId: "met-2", path: "M.Path2", status: StatusOngoing, startedAt: time.Now()}
+	sessions["ms-2"] = &monitorSession{sessionId: "ms-2", serviceId: "met-2", routerIndex: 0, filterKind: "all"}
+
+	UpdateServiceState("met-2", StatusFailed, nil, nil, nil, bcs)
+	<-ch
+
+	metricsMu.Lock()
+	pm := metrics["M.Path2"]
+	metricsMu.Unlock()
+	if pm == nil {
+		t.Fatal("metrics should exist")
+	}
+	if pm.failures != 1 {
+		t.Errorf("want failures=1, got %d", pm.failures)
+	}
+	if pm.successes != 0 {
+		t.Errorf("want successes=0, got %d", pm.successes)
+	}
+}
+
+func TestMetrics_IncrementOnCanceled(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["met-3"] = &invocationState{serviceId: "met-3", path: "M.Path3", status: StatusOngoing, startedAt: time.Now()}
+	sessions["ms-3"] = &monitorSession{sessionId: "ms-3", serviceId: "met-3", routerIndex: 0, filterKind: "all"}
+
+	UpdateServiceState("met-3", StatusCanceled, nil, nil, nil, bcs)
+	<-ch
+
+	metricsMu.Lock()
+	pm := metrics["M.Path3"]
+	metricsMu.Unlock()
+	if pm == nil {
+		t.Fatal("metrics should exist")
+	}
+	if pm.cancels != 1 {
+		t.Errorf("want cancels=1, got %d", pm.cancels)
+	}
+}
+
+func TestMetrics_NoEntryForOngoing(t *testing.T) {
+	resetState()
+	ch := make(chan map[string]interface{}, 4)
+	bcs := []chan map[string]interface{}{ch}
+
+	invocations["met-o"] = &invocationState{serviceId: "met-o", path: "M.PathO", status: StatusOngoing, startedAt: time.Now()}
+	sessions["ms-o"] = &monitorSession{sessionId: "ms-o", serviceId: "met-o", routerIndex: 0, filterKind: "all"}
+
+	UpdateServiceState("met-o", StatusOngoing, nil, nil, nil, bcs)
+	<-ch
+
+	metricsMu.Lock()
+	pm := metrics["M.PathO"]
+	metricsMu.Unlock()
+	if pm != nil && pm.total != 0 {
+		t.Error("ONGOING transitions should not increment the total metric counter")
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }

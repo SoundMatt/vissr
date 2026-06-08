@@ -1,0 +1,787 @@
+package vissServiceSDK
+
+import (
+	"bufio"
+	"encoding/json"
+	"net"
+	"strings"
+	"testing"
+	"time"
+)
+
+// fakeServer runs a minimal TCP server that handles one registration and
+// sends/receives messages for testing. Returns the listener address, a channel
+// of messages received from the client, and a send func for server→client messages.
+func fakeServer(t *testing.T) (addr string, received chan map[string]interface{}, send func(msg map[string]interface{})) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("fakeServer: listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	received = make(chan map[string]interface{}, 16)
+	msgQueue := make(chan map[string]interface{}, 8)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		writer := bufio.NewWriter(conn)
+
+		// Handle registration.
+		if !scanner.Scan() {
+			return
+		}
+		var regMsg map[string]interface{}
+		json.Unmarshal(scanner.Bytes(), &regMsg) //nolint:errcheck
+		ack, _ := json.Marshal(map[string]interface{}{"registered": true, "path": regMsg["path"]})
+		writer.Write(ack)
+		writer.WriteByte('\n')
+		writer.Flush()
+
+		// Fan-out: send queued server→client messages.
+		go func() {
+			for msg := range msgQueue {
+				b, _ := json.Marshal(msg)
+				writer.Write(b)
+				writer.WriteByte('\n')
+				writer.Flush()
+			}
+		}()
+
+		// Collect client→server messages; silently discard auto-health reports
+		// so existing tests are not affected by the §30 auto-send.
+		for scanner.Scan() {
+			var m map[string]interface{}
+			if err := json.Unmarshal(scanner.Bytes(), &m); err == nil {
+				if m["action"] != "health" {
+					received <- m
+				}
+			}
+		}
+	}()
+
+	send = func(msg map[string]interface{}) {
+		msgQueue <- msg
+	}
+
+	return ln.Addr().String(), received, send
+}
+
+// fakeServerRaw is like fakeServer but does NOT filter health messages from
+// received. Use for tests that specifically verify health message delivery (§30).
+func fakeServerRaw(t *testing.T) (addr string, received chan map[string]interface{}, send func(msg map[string]interface{})) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("fakeServerRaw: listen: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+
+	received = make(chan map[string]interface{}, 16)
+	msgQueue := make(chan map[string]interface{}, 8)
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		writer := bufio.NewWriter(conn)
+
+		if !scanner.Scan() {
+			return
+		}
+		var regMsg map[string]interface{}
+		json.Unmarshal(scanner.Bytes(), &regMsg) //nolint:errcheck
+		ack, _ := json.Marshal(map[string]interface{}{"registered": true, "path": regMsg["path"]})
+		writer.Write(ack)
+		writer.WriteByte('\n')
+		writer.Flush()
+
+		go func() {
+			for msg := range msgQueue {
+				b, _ := json.Marshal(msg)
+				writer.Write(b)
+				writer.WriteByte('\n')
+				writer.Flush()
+			}
+		}()
+
+		for scanner.Scan() {
+			var m map[string]interface{}
+			if err := json.Unmarshal(scanner.Bytes(), &m); err == nil {
+				received <- m
+			}
+		}
+	}()
+
+	send = func(msg map[string]interface{}) {
+		msgQueue <- msg
+	}
+
+	return ln.Addr().String(), received, send
+}
+
+func TestNewService_BuilderChain(t *testing.T) {
+	svc := NewService("localhost:8300", "Root.Proc").
+		WithInput("X", "uint8").
+		WithOutput("Y", "uint8")
+	if svc.path != "Root.Proc" {
+		t.Errorf("wrong path: %s", svc.path)
+	}
+	if svc.signature["input"]["X"] != "uint8" {
+		t.Error("input param X missing")
+	}
+	if svc.signature["output"]["Y"] != "uint8" {
+		t.Error("output param Y missing")
+	}
+}
+
+func TestRegister_FailsWithoutHandler(t *testing.T) {
+	svc := NewService("localhost:9", "Root.Proc")
+	_, err := svc.Register()
+	if err == nil || !strings.Contains(err.Error(), "OnInvoke") {
+		t.Fatalf("expected error about missing handler, got %v", err)
+	}
+}
+
+func TestRegister_FailsOnBadAddr(t *testing.T) {
+	svc := NewService("127.0.0.1:1", "Root.Proc").OnInvoke(func(_ *InvokeContext) {})
+	_, err := svc.Register()
+	if err == nil {
+		t.Fatal("expected connection error")
+	}
+}
+
+func TestRegister_SendsRegistrationMessage(t *testing.T) {
+	addr, received, _ := fakeServer(t)
+
+	svc := NewService(addr, "VehicleService.Seating.MoveSeat").
+		WithInput("Position", "uint8").
+		WithOutput("Position", "uint8").
+		OnInvoke(func(_ *InvokeContext) {})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register failed: %v", err)
+	}
+	defer regSvc.Close()
+
+	// Registration message was consumed by fakeServer; ack was received.
+	// Send a deregister to trigger a message we can inspect.
+	regSvc.Close()
+
+	select {
+	case m := <-received:
+		if m["action"] != "deregister" {
+			t.Errorf("expected deregister, got %v", m["action"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for deregister")
+	}
+}
+
+func TestRun_DispatchesInvokeToHandler(t *testing.T) {
+	addr, received, send := fakeServer(t)
+
+	handlerCalled := make(chan *InvokeContext, 1)
+	svc := NewService(addr, "Root.P").
+		WithInput("X", "uint8").
+		WithOutput("Y", "uint8").
+		OnInvoke(func(ctx *InvokeContext) {
+			handlerCalled <- ctx
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-1",
+		"input":     map[string]interface{}{"X": "42"},
+	})
+
+	select {
+	case ctx := <-handlerCalled:
+		if ctx.SessionId != "sess-1" {
+			t.Errorf("wrong sessionId: %s", ctx.SessionId)
+		}
+		if ctx.Input["X"] != "42" {
+			t.Errorf("wrong input: %v", ctx.Input)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for handler")
+	}
+	_ = received
+}
+
+func TestReportProgress_SendsMessageToServer(t *testing.T) {
+	addr, received, send := fakeServer(t)
+
+	svc := NewService(addr, "Root.P").
+		WithOutput("Y", "uint8").
+		OnInvoke(func(ctx *InvokeContext) {
+			ctx.ReportProgress("ONGOING", map[string]interface{}{"Y": "10"})    //nolint:errcheck
+			ctx.ReportProgress("SUCCESSFUL", map[string]interface{}{"Y": "42"}) //nolint:errcheck
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-2",
+		"input":     map[string]interface{}{},
+	})
+
+	var msgs []map[string]interface{}
+	deadline := time.After(2 * time.Second)
+	for len(msgs) < 2 {
+		select {
+		case m := <-received:
+			msgs = append(msgs, m)
+		case <-deadline:
+			t.Fatalf("timeout: got %d messages, want 2", len(msgs))
+		}
+	}
+
+	if msgs[0]["status"] != "ONGOING" {
+		t.Errorf("first message should be ONGOING, got %v", msgs[0]["status"])
+	}
+	if msgs[1]["status"] != "SUCCESSFUL" {
+		t.Errorf("second message should be SUCCESSFUL, got %v", msgs[1]["status"])
+	}
+	for _, m := range msgs {
+		if m["sessionId"] != "sess-2" {
+			t.Errorf("wrong sessionId: %v", m["sessionId"])
+		}
+	}
+}
+
+func TestClose_Idempotent(t *testing.T) {
+	addr, _, _ := fakeServer(t)
+	svc := NewService(addr, "Root.P").OnInvoke(func(_ *InvokeContext) {})
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	// Close twice must not panic.
+	regSvc.Close()
+	regSvc.Close()
+}
+
+// TestRun_RespondsToHeartbeatPing verifies that the SDK replies to a server
+// ping with a pong message (VISSv3.3 §19).
+func TestRun_RespondsToHeartbeatPing(t *testing.T) {
+	addr, received, send := fakeServer(t)
+
+	svc := NewService(addr, "Root.P").OnInvoke(func(_ *InvokeContext) {})
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{"action": "ping"})
+
+	select {
+	case m := <-received:
+		if m["action"] != "pong" {
+			t.Errorf("expected pong, got %v", m["action"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for pong")
+	}
+}
+
+// TestInvokeContext_ReportError verifies that ReportError sends a FAILED
+// message with a structured error payload (VISSv3.3 §20).
+func TestInvokeContext_ReportError_SendsFailed(t *testing.T) {
+	addr, received, send := fakeServer(t)
+
+	svc := NewService(addr, "Root.P").
+		OnInvoke(func(ctx *InvokeContext) {
+			ctx.ReportError("MOTOR_STALL", "seat motor stalled", nil) //nolint:errcheck
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-err",
+		"input":     map[string]interface{}{},
+	})
+
+	select {
+	case m := <-received:
+		if m["status"] != "FAILED" {
+			t.Errorf("want FAILED, got %v", m["status"])
+		}
+		errField, ok := m["error"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("missing 'error' field: %v", m)
+		}
+		if errField["code"] != "MOTOR_STALL" {
+			t.Errorf("wrong error code: %v", errField["code"])
+		}
+		if errField["message"] != "seat motor stalled" {
+			t.Errorf("wrong error message: %v", errField["message"])
+		}
+		if m["sessionId"] != "sess-err" {
+			t.Errorf("wrong sessionId: %v", m["sessionId"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for error report")
+	}
+}
+
+// TestInvokeContext_AuthorizationPassedToHandler verifies that the
+// Authorization field in InvokeContext carries the forwarded client auth token
+// (VISSv3.3 §21).
+func TestInvokeContext_AuthorizationPassedToHandler(t *testing.T) {
+	addr, _, send := fakeServer(t)
+
+	authReceived := make(chan string, 1)
+	svc := NewService(addr, "Root.P").
+		OnInvoke(func(ctx *InvokeContext) {
+			authReceived <- ctx.Authorization
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":        "invoke",
+		"sessionId":     "sess-auth",
+		"input":         map[string]interface{}{},
+		"authorization": "Bearer tok123",
+	})
+
+	select {
+	case got := <-authReceived:
+		if got != "Bearer tok123" {
+			t.Errorf("wrong auth token: %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for handler")
+	}
+}
+
+// TestWithReconnect_BuilderChain verifies that WithReconnect sets the fields
+// and that the builder chain still returns *Service (VISSv3.3 §24).
+func TestWithReconnect_BuilderChain(t *testing.T) {
+	svc := NewService("localhost:8300", "Root.P").
+		OnInvoke(func(_ *InvokeContext) {}).
+		WithReconnect(3, 500*time.Millisecond)
+
+	if !svc.reconnect {
+		t.Error("reconnect should be true")
+	}
+	if svc.maxRetries != 3 {
+		t.Errorf("maxRetries want 3, got %d", svc.maxRetries)
+	}
+	if svc.retryDelay != 500*time.Millisecond {
+		t.Errorf("retryDelay want 500ms, got %v", svc.retryDelay)
+	}
+}
+
+// ---- §26 Cancel propagation -------------------------------------------------
+
+// TestInvokeContext_Done_ClosedOnCancel verifies that ctx.Done() is closed when
+// the server sends a cancel message for the active invocation (VISSv3.3 §26).
+func TestInvokeContext_Done_ClosedOnCancel(t *testing.T) {
+	addr, _, send := fakeServer(t)
+
+	cancelReceived := make(chan struct{})
+	svc := NewService(addr, "Root.P").
+		OnInvoke(func(ctx *InvokeContext) {
+			select {
+			case <-ctx.Done():
+				close(cancelReceived)
+			case <-time.After(3 * time.Second):
+			}
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-cancel",
+		"input":     map[string]interface{}{},
+	})
+
+	// Give the handler time to start and block on Done().
+	time.Sleep(30 * time.Millisecond)
+
+	send(map[string]interface{}{
+		"action":    "cancel",
+		"sessionId": "sess-cancel",
+	})
+
+	select {
+	case <-cancelReceived:
+		// ctx.Done() was closed — correct.
+	case <-time.After(2 * time.Second):
+		t.Fatal("ctx.Done() was not closed after server cancel")
+	}
+}
+
+// TestInvokeContext_Done_OpenDuringInvoke verifies that Done() is not yet
+// closed when the handler starts (before any cancel).
+func TestInvokeContext_Done_OpenDuringInvoke(t *testing.T) {
+	addr, _, send := fakeServer(t)
+
+	doneOpen := make(chan bool, 1)
+	svc := NewService(addr, "Root.P").
+		OnInvoke(func(ctx *InvokeContext) {
+			select {
+			case <-ctx.Done():
+				doneOpen <- false
+			default:
+				doneOpen <- true
+			}
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-nodecancel",
+		"input":     map[string]interface{}{},
+	})
+
+	select {
+	case open := <-doneOpen:
+		if !open {
+			t.Error("Done() should be open during normal handler execution")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not run")
+	}
+}
+
+// ---- §27 Service versioning -------------------------------------------------
+
+// TestWithVersion_BuilderChain verifies that WithVersion sets the field and
+// returns the service for chaining (VISSv3.3 §27).
+func TestWithVersion_BuilderChain(t *testing.T) {
+	svc := NewService("localhost:8300", "Root.P").
+		WithVersion("2.1.0").
+		OnInvoke(func(_ *InvokeContext) {})
+	if svc.version != "2.1.0" {
+		t.Errorf("want version 2.1.0, got %q", svc.version)
+	}
+}
+
+// TestRegister_SendsVersionInRegistrationMessage verifies that the version
+// is included in the register message when WithVersion is called (§27).
+func TestRegister_SendsVersionInRegistrationMessage(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	regMsgCh := make(chan map[string]interface{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		sc := bufio.NewScanner(conn)
+		if sc.Scan() {
+			var m map[string]interface{}
+			json.Unmarshal(sc.Bytes(), &m) //nolint:errcheck
+			regMsgCh <- m
+		}
+		wr := bufio.NewWriter(conn)
+		ack, _ := json.Marshal(map[string]interface{}{"registered": true})
+		wr.Write(ack)
+		wr.WriteByte('\n')
+		wr.Flush()
+	}()
+
+	svc := NewService(ln.Addr().String(), "Root.P").
+		WithVersion("1.5.0").
+		OnInvoke(func(_ *InvokeContext) {})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+
+	select {
+	case m := <-regMsgCh:
+		if m["version"] != "1.5.0" {
+			t.Errorf("want version 1.5.0 in registration message, got %v", m["version"])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for registration message")
+	}
+}
+
+// TestRegister_NoVersionWhenEmpty verifies that "version" is absent when
+// WithVersion is not called.
+func TestRegister_NoVersionWhenEmpty(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	regMsgCh := make(chan map[string]interface{}, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		sc := bufio.NewScanner(conn)
+		if sc.Scan() {
+			var m map[string]interface{}
+			json.Unmarshal(sc.Bytes(), &m) //nolint:errcheck
+			regMsgCh <- m
+		}
+		wr := bufio.NewWriter(conn)
+		ack, _ := json.Marshal(map[string]interface{}{"registered": true})
+		wr.Write(ack)
+		wr.WriteByte('\n')
+		wr.Flush()
+	}()
+
+	svc := NewService(ln.Addr().String(), "Root.P").
+		OnInvoke(func(_ *InvokeContext) {})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+
+	select {
+	case m := <-regMsgCh:
+		if _, ok := m["version"]; ok {
+			t.Error("version should be absent when WithVersion not called")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout")
+	}
+}
+
+// ---- §28 Progress percentage ------------------------------------------------
+
+// TestReportProgressPct_SendsProgressField verifies that ReportProgressPct
+// includes "progress" in the message sent to the server (VISSv3.3 §28).
+func TestReportProgressPct_SendsProgressField(t *testing.T) {
+	addr, received, send := fakeServer(t)
+
+	svc := NewService(addr, "Root.P").
+		OnInvoke(func(ctx *InvokeContext) {
+			ctx.ReportProgressPct(50, "ONGOING", nil) //nolint:errcheck
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-pct",
+		"input":     map[string]interface{}{},
+	})
+
+	select {
+	case m := <-received:
+		if m["sessionId"] != "sess-pct" {
+			t.Errorf("unexpected message: %v", m)
+		}
+		pct, ok := m["progress"]
+		if !ok {
+			t.Fatal("progress field missing")
+		}
+		if pct != float64(50) {
+			t.Errorf("want progress=50, got %v", pct)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for progress report")
+	}
+}
+
+// TestReportProgressPct_ClampsOutOfRange verifies that values outside [0,100]
+// are clamped before being sent.
+func TestReportProgressPct_ClampsOutOfRange(t *testing.T) {
+	addr, received, send := fakeServer(t)
+
+	svc := NewService(addr, "Root.P").
+		OnInvoke(func(ctx *InvokeContext) {
+			ctx.ReportProgressPct(150, "ONGOING", nil) //nolint:errcheck
+			ctx.ReportProgressPct(-5, "ONGOING", nil)  //nolint:errcheck
+		})
+
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+	go regSvc.Run()
+
+	send(map[string]interface{}{
+		"action":    "invoke",
+		"sessionId": "sess-clamp",
+		"input":     map[string]interface{}{},
+	})
+
+	var msgs []map[string]interface{}
+	deadline := time.After(2 * time.Second)
+	for len(msgs) < 2 {
+		select {
+		case m := <-received:
+			msgs = append(msgs, m)
+		case <-deadline:
+			t.Fatalf("timeout: collected %d messages", len(msgs))
+		}
+	}
+
+	if msgs[0]["progress"] != float64(100) {
+		t.Errorf("want 100 for >100 input, got %v", msgs[0]["progress"])
+	}
+	if msgs[1]["progress"] != float64(0) {
+		t.Errorf("want 0 for <0 input, got %v", msgs[1]["progress"])
+	}
+}
+
+// ---- §30 Service health reporting -------------------------------------------
+
+// TestConnect_AutoSendsHealthyTrue verifies that Register() causes the SDK
+// to automatically send a health=true report after successful registration (§30).
+func TestConnect_AutoSendsHealthyTrue(t *testing.T) {
+	addr, received, _ := fakeServerRaw(t)
+
+	svc := NewService(addr, "Root.P").OnInvoke(func(_ *InvokeContext) {})
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+
+	select {
+	case m := <-received:
+		if m["action"] != "health" {
+			t.Errorf("want first post-registration message to be health, got %v", m["action"])
+		}
+		if m["healthy"] != true {
+			t.Errorf("want healthy=true in auto-sent health, got %v", m["healthy"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for auto health message")
+	}
+}
+
+// TestReportHealth_SendsHealthMessage verifies that ReportHealth sends the
+// expected message to the server (VISSv3.3 §30).
+func TestReportHealth_SendsHealthMessage(t *testing.T) {
+	addr, received, _ := fakeServerRaw(t)
+
+	svc := NewService(addr, "Root.P").OnInvoke(func(_ *InvokeContext) {})
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	defer regSvc.Close()
+
+	// Drain the auto-health message from connect().
+	select {
+	case <-received:
+	case <-time.After(time.Second):
+		t.Fatal("auto-health message not received")
+	}
+
+	if err := regSvc.ReportHealth(false, "motor overheated"); err != nil {
+		t.Fatalf("ReportHealth: %v", err)
+	}
+
+	select {
+	case m := <-received:
+		if m["action"] != "health" {
+			t.Errorf("want action=health, got %v", m["action"])
+		}
+		if m["healthy"] != false {
+			t.Errorf("want healthy=false, got %v", m["healthy"])
+		}
+		if m["detail"] != "motor overheated" {
+			t.Errorf("wrong detail: %v", m["detail"])
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for health message")
+	}
+}
+
+// TestRun_NoReconnectByDefault verifies that Run() exits without reconnecting
+// when WithReconnect is not called and the server closes the connection.
+func TestRun_NoReconnectByDefault(t *testing.T) {
+	addr, _, send := fakeServer(t)
+
+	svc := NewService(addr, "Root.P").OnInvoke(func(_ *InvokeContext) {})
+	regSvc, err := svc.Register()
+	if err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		regSvc.Run()
+		close(done)
+	}()
+
+	// Close the connection from the server side by sending a nonsense close signal.
+	// We do this by closing the service connection itself.
+	regSvc.conn.Close()
+	send(map[string]interface{}{}) // unblock the queue goroutine
+
+	select {
+	case <-done:
+		// Run() exited without reconnect attempt — correct.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not exit after connection close")
+	}
+}
