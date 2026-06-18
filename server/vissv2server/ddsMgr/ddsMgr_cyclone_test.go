@@ -32,7 +32,7 @@ func TestDdsVissRoundTrip_Cyclone(t *testing.T) {
 	t.Cleanup(resetReplies)
 	transportChan := make(chan string, 8)
 
-	go DdsMgrInit(5, transportChan)
+	go DdsMgrInit(5, transportChan, transportChan)
 	// 2s startup sleep + extra time for CycloneDDS participant discovery.
 	time.Sleep(4 * time.Second)
 

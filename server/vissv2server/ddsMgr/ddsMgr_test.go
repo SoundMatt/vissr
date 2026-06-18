@@ -307,7 +307,7 @@ func TestVissV2Receiver_ForwardsMessages(t *testing.T) {
 func TestGetVehicleTopic_EnvVar(t *testing.T) {
 	t.Setenv("DDS_VIN", "TESTVIN001")
 	ch := make(chan string)
-	topic := getVehicleTopic(ch, 5)
+	topic := getVehicleTopic(ch, ch, 5)
 	if topic != "/TESTVIN001/Vehicle" {
 		t.Errorf("got %q, want /TESTVIN001/Vehicle", topic)
 	}
@@ -316,7 +316,7 @@ func TestGetVehicleTopic_EnvVar(t *testing.T) {
 func TestGetVehicleTopic_InvalidEnvVar(t *testing.T) {
 	t.Setenv("DDS_VIN", "BAD/VIN")
 	ch := make(chan string)
-	topic := getVehicleTopic(ch, 5)
+	topic := getVehicleTopic(ch, ch, 5)
 	if topic != "" {
 		t.Errorf("expected empty topic for invalid VIN, got %q", topic)
 	}
@@ -327,7 +327,7 @@ func TestGetVehicleTopic_ChannelRoundTrip(t *testing.T) {
 	ch := make(chan string)
 	done := make(chan string, 1)
 
-	go func() { done <- getVehicleTopic(ch, 5) }()
+	go func() { done <- getVehicleTopic(ch, ch, 5) }()
 
 	// consume the VIN request, reply with a valid VIN response
 	<-ch
@@ -350,7 +350,7 @@ func TestGetVehicleTopic_ChannelPathInvalidVin(t *testing.T) {
 	ch := make(chan string)
 	done := make(chan string, 1)
 
-	go func() { done <- getVehicleTopic(ch, 5) }()
+	go func() { done <- getVehicleTopic(ch, ch, 5) }()
 
 	<-ch                                         // consume the outgoing VIN request
 	ch <- `{"data":{"dp":{"value":"BAD/VIN"}}}` // reply with an invalid VIN
@@ -369,7 +369,7 @@ func TestGetVehicleTopic_Timeout(t *testing.T) {
 	t.Setenv("DDS_VIN", "")
 	ch := make(chan string)
 	done := make(chan string, 1)
-	go func() { done <- getVehicleTopic(ch, 5) }()
+	go func() { done <- getVehicleTopic(ch, ch, 5) }()
 	<-ch // consume the request but never reply
 
 	// Wait 6 seconds for the 5-second timeout inside getVehicleTopic.
@@ -424,7 +424,7 @@ func TestDdsMgrInit_InvalidVin_ExitsCleanly(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		DdsMgrInit(5, make(chan string))
+		DdsMgrInit(5, make(chan string), make(chan string))
 		close(done)
 	}()
 
@@ -448,7 +448,7 @@ func TestDdsMgrInit_ParticipantFailure(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		DdsMgrInit(5, make(chan string))
+		DdsMgrInit(5, make(chan string), make(chan string))
 		close(done)
 	}()
 	select {
@@ -471,7 +471,7 @@ func TestDdsMgrInit_SubscriberFailure(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		DdsMgrInit(5, make(chan string))
+		DdsMgrInit(5, make(chan string), make(chan string))
 		close(done)
 	}()
 	select {
@@ -494,7 +494,7 @@ func TestDdsMgrInit_PublisherFailure(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		DdsMgrInit(5, make(chan string))
+		DdsMgrInit(5, make(chan string), make(chan string))
 		close(done)
 	}()
 	select {
@@ -520,7 +520,7 @@ func TestDdsMgrInit_MalformedSample_DropsAndContinues(t *testing.T) {
 	t.Cleanup(resetReplies)
 	transportChan := make(chan string, 8)
 
-	go DdsMgrInit(5, transportChan)
+	go DdsMgrInit(5, transportChan, transportChan)
 	time.Sleep(3 * time.Second)
 
 	// Payload missing "replyTopic" → decomposeDdsPayload returns "", "" →
@@ -549,7 +549,7 @@ func TestDdsMgrInit_HappyPath_FullRoundTrip(t *testing.T) {
 	t.Cleanup(resetReplies)
 	transportChan := make(chan string, 8)
 
-	go DdsMgrInit(5, transportChan)
+	go DdsMgrInit(5, transportChan, transportChan)
 	time.Sleep(3 * time.Second)
 
 	// Deliver a valid DDS sample. DdsMgrInit will:
@@ -580,7 +580,7 @@ func TestDdsMgrInit_VissV2Chan_NoReplyTopic(t *testing.T) {
 	t.Cleanup(resetReplies)
 	transportChan := make(chan string, 8)
 
-	go DdsMgrInit(5, transportChan)
+	go DdsMgrInit(5, transportChan, transportChan)
 	time.Sleep(3 * time.Second)
 
 	// Send directly to transportChan; vissV2Receiver picks it up and puts it
@@ -611,7 +611,7 @@ func TestDdsMgrInit_StartsWithValidVin(t *testing.T) {
 	started := make(chan struct{})
 	go func() {
 		close(started)
-		DdsMgrInit(5, transportChan)
+		DdsMgrInit(5, transportChan, transportChan)
 	}()
 	<-started
 	// Allow the manager to pass the 2-second startup sleep and enter its loop.

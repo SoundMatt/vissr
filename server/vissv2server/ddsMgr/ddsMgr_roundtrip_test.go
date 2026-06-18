@@ -32,7 +32,7 @@ func TestDdsVissRoundTrip_Mock(t *testing.T) {
 	t.Cleanup(resetReplies)
 	transportChan := make(chan string, 8)
 
-	go DdsMgrInit(5, transportChan)
+	go DdsMgrInit(5, transportChan, transportChan)
 	time.Sleep(3 * time.Second)
 
 	// Client participant on the same process-global mock broker.

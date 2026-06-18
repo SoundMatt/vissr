@@ -101,7 +101,7 @@ func isValidVin(vin string) bool {
 	return true
 }
 
-func getVehicleTopic(transportMgrChan chan string, mgrId int) string {
+func getVehicleTopic(reqChan, respChan chan string, mgrId int) string {
 	if vin := os.Getenv("DDS_VIN"); vin != "" {
 		if !isValidVin(vin) {
 			utils.Error.Printf("ddsMgr: DDS_VIN=%q is not a valid VIN", vin)
@@ -112,10 +112,10 @@ func getVehicleTopic(transportMgrChan chan string, mgrId int) string {
 	}
 
 	vinRequest := `{"RouterId":"` + strconv.Itoa(mgrId) + `?0","action":"get","path":"Vehicle.VehicleIdentification.VIN","requestId":"570416","origin":"internal"}`
-	transportMgrChan <- vinRequest
+	reqChan <- vinRequest
 
 	select {
-	case response := <-transportMgrChan:
+	case response := <-respChan:
 		vin := extractVin(response)
 		if !isValidVin(vin) {
 			utils.Error.Printf("ddsMgr: invalid VIN %q in server response (set DDS_VIN to override)", vin)
@@ -169,14 +169,14 @@ func decomposeDdsPayload(payload string) (replyTopic, request string) {
 	return rt, string(reqBytes)
 }
 
-func addRoutingAndForward(request string, mgrId, clientId int, transportMgrChan chan string) {
+func addRoutingAndForward(request string, mgrId, clientId int, reqChan chan string) {
 	prefix := `{"RouterId":"` + strconv.Itoa(mgrId) + "?" + strconv.Itoa(clientId) + `", `
-	transportMgrChan <- strings.Replace(request, "{", prefix, 1)
+	reqChan <- strings.Replace(request, "{", prefix, 1)
 }
 
-func vissV2Receiver(transportMgrChan chan string, vissv2Chan chan string) {
+func vissV2Receiver(respChan chan string, vissv2Chan chan string) {
 	for {
-		vissv2Chan <- <-transportMgrChan
+		vissv2Chan <- <-respChan
 	}
 }
 
@@ -212,9 +212,11 @@ func ddsErrDetail(err error) string {
 
 // DdsMgrInit is the transport manager entry point called by vissv2server.
 // mgrId is the channel-slot index assigned to this manager (slot 5).
-// transportMgrChan is the shared bidirectional channel to the server core;
-// it must be unbuffered (same requirement as the MQTT manager).
-func DdsMgrInit(mgrId int, transportMgrChan chan string) {
+// reqChan carries requests to the server core; respChan carries responses back
+// (the split introduced in PR #187 so a response can never be read back as a
+// request). Both must be unbuffered: getVehicleTopic performs a synchronous VIN
+// request/response handshake across them.
+func DdsMgrInit(mgrId int, reqChan, respChan chan string) {
 	participant, err := newParticipant()
 	if err != nil {
 		utils.Error.Printf("ddsMgr: cannot create DDS participant: %v", err)
@@ -224,7 +226,7 @@ func DdsMgrInit(mgrId int, transportMgrChan chan string) {
 
 	// Allow the feeder and state storage to start before requesting the VIN.
 	time.Sleep(2 * time.Second)
-	vehicleTopic := getVehicleTopic(transportMgrChan, mgrId)
+	vehicleTopic := getVehicleTopic(reqChan, respChan, mgrId)
 	if vehicleTopic == "" {
 		utils.Error.Printf("ddsMgr: could not derive vehicle topic; manager not started")
 		return
@@ -247,7 +249,7 @@ func DdsMgrInit(mgrId int, transportMgrChan chan string) {
 	utils.JsonSchemaInit()
 
 	vissv2Chan := make(chan string)
-	go vissV2Receiver(transportMgrChan, vissv2Chan)
+	go vissV2Receiver(respChan, vissv2Chan)
 
 	utils.Info.Println("**** DDS manager hub entering server loop... ****")
 
@@ -282,7 +284,7 @@ func DdsMgrInit(mgrId int, transportMgrChan chan string) {
 			}
 
 			replies.push(replyTopic, topicId)
-			addRoutingAndForward(request, mgrId, topicId, transportMgrChan)
+			addRoutingAndForward(request, mgrId, topicId, reqChan)
 			topicId++
 
 		case vissv2Msg := <-vissv2Chan:
